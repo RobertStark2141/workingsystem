@@ -1,1 +1,169 @@
+//assisted by ai 
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <esp_now.h>
+#include <WiFi.h>
 
+// 0.96" OLED - standard 128x64
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C   // 0x3D on some clones, 0x3C worked for mine
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Buttons - wired to GND, internal pull-ups
+const int BTN1 = 2;  // D0 - half sequence toggle
+const int BTN2 = 3;  // D1 - one step at a time
+const int BTN3 = 4;  // D2 - fires magnet sequence directly on magnet ESP
+
+// Housing ESP MAC - had to flash a sketch to read this off the chip, eFuse trick
+uint8_t housingMAC[] = {0xD4, 0xE9, 0xF4, 0x72, 0x9A, 0x68};
+
+// Magnet ESP MAC - lifted from housing code so BTN3 can talk to it directly
+uint8_t magnetMAC[] = {0xB0, 0xCB, 0xD8, 0xE2, 0xC4, 0x14};
+
+// Local counters just for the OLED, housing keeps the real state
+int halfStage = 0;       // 0 = first half next, 1 = second half next
+int stepCounter = 0;     // 1..9 then wraps
+
+void sendCommand(char c) {
+  uint8_t msg = (uint8_t)c;
+  esp_err_t result = esp_now_send(housingMAC, &msg, 1);
+  Serial.print("Sent '"); Serial.print(c); Serial.print("' -> ");
+  Serial.println(result == ESP_OK ? "OK" : "FAIL");
+}
+
+// Same as sendCommand but targets the magnet ESP instead of the housing
+void sendToMagnet(char c) {
+  uint8_t msg = (uint8_t)c;
+  esp_err_t result = esp_now_send(magnetMAC, &msg, 1);
+  Serial.print("Sent '"); Serial.print(c); Serial.print("' to magnet -> ");
+  Serial.println(result == ESP_OK ? "OK" : "FAIL");
+}
+
+// Two-line layout for showing what got sent
+void showLines(const char* l1, const char* l2 = nullptr) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  if (l2) {
+    display.setCursor(0, 8);  display.print(l1);
+    display.setCursor(0, 36); display.print(l2);
+  } else {
+    display.setCursor(0, (SCREEN_HEIGHT/2) - 8);
+    display.print(l1);
+  }
+  display.display();
+}
+
+void showReady() { showLines("Ready"); }
+
+// Cheap debounce. check, wait, check again
+bool pressed(int pin) {
+  if (digitalRead(pin) != LOW) return false;
+  delay(25);
+  if (digitalRead(pin) != LOW) return false;
+  return true;
+}
+
+// Block until they let go, otherwise it spams sends
+void waitRelease(int pin) {
+  while (digitalRead(pin) == LOW) delay(10);
+  delay(25);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN2, INPUT_PULLUP);
+  pinMode(BTN3, INPUT_PULLUP);
+
+  Wire.begin();  // SDA/SCL default pins on the XIAO
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed");
+    while (true) delay(100);  // dead loop, no point continuing
+  }
+  showLines("Booting...");
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("Watch MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    showLines("ESP-NOW", "FAIL");
+    while (true) delay(100);
+  }
+
+  // Register housing as a peer so we can send to it
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, housingMAC, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("Failed to add housing peer!");
+    showLines("Peer", "FAIL");
+    while (true) delay(100);
+  }
+
+  // Register magnet ESP as a second peer so BTN3 can fire it directly
+  esp_now_peer_info_t magPeer = {};
+  memcpy(magPeer.peer_addr, magnetMAC, 6);
+  magPeer.channel = 0;
+  magPeer.encrypt = false;
+  if (esp_now_add_peer(&magPeer) != ESP_OK) {
+    Serial.println("Failed to add magnet peer!");
+    showLines("MagPeer", "FAIL");
+    while (true) delay(100);
+  }
+
+  showReady();
+  Serial.println("Watch ready");
+  Serial.println("BTN1 = half toggle (H)");
+  Serial.println("BTN2 = single step (T)");
+  Serial.println("BTN3 = magnet sequence (R) -> magnet ESP");
+}
+
+void loop() {
+  // BTN1, first press runs steps 1-4, second press runs 5-9
+  if (pressed(BTN1)) {
+    sendCommand('H');
+    if (halfStage == 0) {
+      showLines("Half 1/2", "Deploy");
+      halfStage = 1;
+    } else {
+      showLines("Half 2/2", "Retract");
+      halfStage = 0;
+    }
+    waitRelease(BTN1);
+    delay(2000);   // leave the message up for a sec
+    showReady();
+  }
+
+  // BTN2 is a one step per press, wraps back to 1 after step 9
+  if (pressed(BTN2)) {
+    sendCommand('T');
+    stepCounter++;
+    if (stepCounter > 9) stepCounter = 1;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Step %d/9", stepCounter);
+    showLines(buf);
+    waitRelease(BTN2);
+    delay(2000);
+    showReady();
+  }
+
+  // BTN3 fires the magnet sequence directly on the magnet ESP (bypasses housing)
+  if (pressed(BTN3)) {
+    sendToMagnet('R');
+    showLines("Magnet", "Run");
+    waitRelease(BTN3);
+    delay(1500);
+    showReady();
+  }
+
+  delay(10);
+}
