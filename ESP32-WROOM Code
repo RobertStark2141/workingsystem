@@ -1,1 +1,449 @@
+//assisted by ai 
+#include <esp_now.h>
+#include <WiFi.h>
 
+// Motor driver pins. 3 motors total
+#define M1_IN1 19
+#define M1_IN2 23
+#define M2_IN1 32
+#define M2_IN2 33
+#define M3_IN1 21
+#define M3_IN2 4
+
+// Single magnet on the housing (separate from the 6-magnet array)
+#define MAG_SLEEP 26
+#define MAG_EN    27
+#define MAG_PH    14
+
+//  linear actuator 1 for side palte locking
+#define ACT_IN1 5
+#define ACT_IN2 18
+#define ACT_IN3 15
+#define ACT_IN4 2
+
+// Linear actuator 2 for track close
+#define ACT2_IN1 12
+#define ACT2_IN2 13
+#define ACT2_IN3 16
+#define ACT2_IN4 17
+
+// Tunable from serial - keep these as ints not const
+int M1_SPEED  = 100;   // M1 runs slower to match M2 (different supplier, RPM mismatch)
+int M2_SPEED  = 255;
+int M3_SPEED  = 255;
+int MAG_SPEED = 255;
+int G_TIME    = 2000;
+int B_TIME    = 2000;
+int M3_TIME   = 4100;  // bumped up from 3700 after testing
+
+int ACT_STEPS  = 2000;
+int ACT2_STEPS = 600;
+
+const int ACT_DELAY_US = 400;
+const int ACT_DIR_FLIP = -1;  // wired backwards, flip in software
+
+// PWM at 100Hz, 8-bit res
+const int PWM_FREQ = 100;
+const int PWM_RES  = 8;
+
+bool stopped = false;
+
+// Half-stepping table for the steppers
+const int SEQ[4][4] = {
+  {1, 0, 1, 0},
+  {0, 1, 1, 0},
+  {0, 1, 0, 1},
+  {1, 0, 0, 1},
+};
+
+// Magnet ESP MAC
+uint8_t magnetMAC[] = {0xB0, 0xCB, 0xD8, 0xE2, 0xC4, 0x14};
+volatile bool magnetDone = false;  // set by recv callback when magnet ESP replies
+
+// Flags from the watch - all set in the recv callback
+volatile bool watchHalfRequested  = false;
+volatile bool watchStepRequested  = false;
+volatile bool watchResetRequested = false;
+
+// Two separate state machines for the two watch modes
+int halfStage = 0;   // 0 = run first half next, 1 = run second half next
+int stepIndex = 0;   // last step run, 0 means none yet
+
+// Receive handler. just sets flags, no heavy work in here
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len <= 0) return;
+  switch (data[0]) {
+    case 'D': magnetDone          = true; Serial.println("[ESP-NOW] Magnet DONE"); break;
+    case 'H': watchHalfRequested  = true; Serial.println("[ESP-NOW] Watch HALF");  break;
+    case 'T': watchStepRequested  = true; Serial.println("[ESP-NOW] Watch STEP");  break;
+    case 'Z': watchResetRequested = true; Serial.println("[ESP-NOW] Watch RESET"); break;
+  }
+}
+
+void sendRunToMagnet() {
+  uint8_t msg = 'R';
+  esp_err_t result = esp_now_send(magnetMAC, &msg, 1);
+  if (result == ESP_OK) Serial.println("[ESP-NOW] Sent RUN to magnet ESP");
+  else                  Serial.println("[ESP-NOW] Send FAILED");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  delay(100);  // give the radio a moment or MAC reads as zeros
+  Serial.print("Housing MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    while (true);
+  }
+  esp_now_register_recv_cb(onDataRecv);
+
+  // Add magnet as a peer so we can fire commands at it
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, magnetMAC, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) Serial.println("Failed to add magnet peer!");
+  else                                   Serial.println("[ESP-NOW] Magnet peer registered");
+  // Watch is receive-only, no peer needed for it
+
+  // Attach PWM to all the motor pins
+  ledcAttach(M1_IN1, PWM_FREQ, PWM_RES);
+  ledcAttach(M1_IN2, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_IN1, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_IN2, PWM_FREQ, PWM_RES);
+  ledcAttach(M3_IN1, PWM_FREQ, PWM_RES);
+  ledcAttach(M3_IN2, PWM_FREQ, PWM_RES);
+  ledcAttach(MAG_EN, PWM_FREQ, PWM_RES);
+
+  pinMode(MAG_SLEEP, OUTPUT);
+  pinMode(MAG_PH,    OUTPUT);
+
+  pinMode(ACT_IN1,  OUTPUT); pinMode(ACT_IN2,  OUTPUT);
+  pinMode(ACT_IN3,  OUTPUT); pinMode(ACT_IN4,  OUTPUT);
+  pinMode(ACT2_IN1, OUTPUT); pinMode(ACT2_IN2, OUTPUT);
+  pinMode(ACT2_IN3, OUTPUT); pinMode(ACT2_IN4, OUTPUT);
+
+  // Make sure everything's off at boot
+  digitalWrite(MAG_SLEEP, LOW);
+  digitalWrite(MAG_PH,    LOW);
+  actCoilsOff();
+  act2CoilsOff();
+  allBrake();
+
+  Serial.println("Ready.");
+  Serial.println("U/D=motor1  Y/F=motor2  I/K=motor3  S=stop all");
+  Serial.println("G=1&2 deploy  B=1&2 retract");
+  Serial.println("P=mag pull 1s  R=mag repel 1s  X=mag off");
+  Serial.println("E=ACT1 extend  Q=ACT1 retract");
+  Serial.println("J=ACT2 extend  L=ACT2 retract");
+  Serial.println("1=test seq 1   2=full seq 2");
+  Serial.println("Watch: H=half-toggle  T=step-by-step  Z=reset");
+  Serial.println("?=settings   $=state");
+}
+
+// Each step of the main sequence broken out so the watch can fire them individually
+
+void seqStep1() {
+  Serial.println("Step 1: M3 backward");
+  m3Backward(); delay(M3_TIME); m3Brake();
+}
+
+void seqStep2() {
+  Serial.println("Step 2: ACT1 extend");
+  actMove(ACT_STEPS, +1);
+}
+
+void seqStep3() {
+  Serial.println("Step 3: deploy + magnet sequence");
+  m1Backward(); m2Backward();
+  delay(2600);   // got this from trial and error
+  m1Brake(); m2Brake();
+
+  // Tell magnet ESP to run, then wait for the ack
+  magnetDone = false;
+  sendRunToMagnet();
+  Serial.println("  Waiting for magnet ESP...");
+  while (!magnetDone) delay(10);  // blocks for ~16s, expected
+  Serial.println("  Magnet done");
+}
+
+void seqStep4() {
+  Serial.println("Step 4: ACT2 retract 4mm");
+  act2Move(ACT2_STEPS, -1);
+}
+
+void seqStep5() {
+  Serial.println("Step 5: wait 2s");
+  delay(2000);
+}
+
+void seqStep6() {
+  Serial.println("Step 6: ACT2 extend 4mm");
+  act2Move(ACT2_STEPS, +1);
+}
+
+void seqStep7() {
+  Serial.println("Step 7: retract M1+M2");
+  m1Forward(); m2Forward();
+  delay(2400);   // slightly less than deploy, plates need less travel back
+  m1Brake(); m2Brake();
+}
+
+void seqStep8() {
+  Serial.println("Step 8: ACT1 retract");
+  actMove(ACT_STEPS, -1);
+}
+
+void seqStep9() {
+  Serial.println("Step 9: M3 forward + magnet repel");
+  m3Forward();
+  magRepel();
+  delay(1000);
+  magOff();
+  delay(2500);   // let M3 finish the travel after magnet's done
+  m3Brake();
+}
+
+// Convenience wrappers
+void runFirstHalf()  { seqStep1(); seqStep2(); seqStep3(); seqStep4(); }
+void runSecondHalf() { seqStep5(); seqStep6(); seqStep7(); seqStep8(); seqStep9(); }
+void runFullSeq2()   { runFirstHalf(); runSecondHalf(); }
+
+void runOneStep(int idx) {
+  switch (idx) {
+    case 1: seqStep1(); break;
+    case 2: seqStep2(); break;
+    case 3: seqStep3(); break;
+    case 4: seqStep4(); break;
+    case 5: seqStep5(); break;
+    case 6: seqStep6(); break;
+    case 7: seqStep7(); break;
+    case 8: seqStep8(); break;
+    case 9: seqStep9(); break;
+  }
+}
+
+void loop() {
+  // Handle watch flags first. they shouldn't fight with serial input
+
+  if (watchResetRequested) {
+    watchResetRequested = false;
+    halfStage = 0;
+    stepIndex = 0;
+    Serial.println(">>> RESET");
+  }
+
+  if (watchHalfRequested) {
+    watchHalfRequested = false;
+    if (halfStage == 0) {
+      Serial.println(">>> Watch: first half");
+      runFirstHalf();
+      halfStage = 1;
+      Serial.println(">>> First half done, press again for second");
+    } else {
+      Serial.println(">>> Watch: second half");
+      runSecondHalf();
+      halfStage = 0;
+      Serial.println(">>> Sequence complete");
+    }
+  }
+
+  if (watchStepRequested) {
+    watchStepRequested = false;
+    stepIndex++;
+    if (stepIndex > 9) stepIndex = 1;  // wrap around
+    Serial.print(">>> Watch: step "); Serial.println(stepIndex);
+    runOneStep(stepIndex);
+    if (stepIndex == 9) Serial.println(">>> All 9 done, next press wraps");
+  }
+
+  // Serial commands. kept all the manual control so I can still test individually
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input == "S" || input == "s") {
+      // Hard stop everything. useful when something's gone wrong
+      stopped = true;
+      allBrake();
+      magOff();
+      actCoilsOff();
+      act2CoilsOff();
+      Serial.println("STOPPED - any move key resumes");
+    }
+    else if (input == "?") {
+      // Dump all the tunables
+      Serial.print("M1: ");   Serial.println(M1_SPEED);
+      Serial.print("M2: ");   Serial.println(M2_SPEED);
+      Serial.print("M3: ");   Serial.println(M3_SPEED);
+      Serial.print("Mag: ");  Serial.println(MAG_SPEED);
+      Serial.print("G: ");    Serial.print(G_TIME);  Serial.println("ms");
+      Serial.print("B: ");    Serial.print(B_TIME);  Serial.println("ms");
+      Serial.print("M3t: ");  Serial.print(M3_TIME); Serial.println("ms");
+      Serial.print("ACT1: "); Serial.println(ACT_STEPS);
+      Serial.print("ACT2: "); Serial.println(ACT2_STEPS);
+    }
+    else if (input == "$") {
+      // State machine debug
+      Serial.print("halfStage: "); Serial.println(halfStage);
+      Serial.print("stepIndex: "); Serial.println(stepIndex);
+    }
+    // Speed setters. format is "1:200" etc
+    else if (input.startsWith("1:")) {
+      M1_SPEED = constrain(input.substring(2).toInt(), 0, 255);
+      Serial.print("M1 speed: "); Serial.println(M1_SPEED);
+    }
+    else if (input.startsWith("2:")) {
+      M2_SPEED = constrain(input.substring(2).toInt(), 0, 255);
+      Serial.print("M2 speed: "); Serial.println(M2_SPEED);
+    }
+    else if (input.startsWith("3:")) {
+      M3_SPEED = constrain(input.substring(2).toInt(), 0, 255);
+      Serial.print("M3 speed: "); Serial.println(M3_SPEED);
+    }
+    else if (input.startsWith("M:") || input.startsWith("m:")) {
+      MAG_SPEED = constrain(input.substring(2).toInt(), 0, 255);
+      Serial.print("Mag power: "); Serial.println(MAG_SPEED);
+    }
+    // Timing setters
+    else if (input.startsWith("GT:") || input.startsWith("gt:") || input.startsWith("Gt:")) {
+      int val = input.substring(3).toInt();
+      if (val > 0) { G_TIME = val; Serial.print("G time: "); Serial.print(G_TIME); Serial.println("ms"); }
+    }
+    else if (input.startsWith("BT:") || input.startsWith("bt:") || input.startsWith("Bt:")) {
+      int val = input.substring(3).toInt();
+      if (val > 0) { B_TIME = val; Serial.print("B time: "); Serial.print(B_TIME); Serial.println("ms"); }
+    }
+    else if (input.startsWith("3T:") || input.startsWith("3t:")) {
+      int val = input.substring(3).toInt();
+      if (val > 0) { M3_TIME = val; Serial.print("M3 time: "); Serial.print(M3_TIME); Serial.println("ms"); }
+    }
+    else if (input.startsWith("AT:") || input.startsWith("at:")) {
+      int val = input.substring(3).toInt();
+      if (val > 0) { ACT_STEPS = val; Serial.print("ACT1: "); Serial.println(ACT_STEPS); }
+    }
+    else if (input.startsWith("A2:") || input.startsWith("a2:")) {
+      int val = input.substring(3).toInt();
+      if (val > 0) { ACT2_STEPS = val; Serial.print("ACT2: "); Serial.println(ACT2_STEPS); }
+    }
+    else {
+      // Single letter movement commands
+      char cmd = input.charAt(0);
+
+      // If we're in a stopped state, any movement key wakes us back up
+      if (stopped) {
+        if (strchr("UuDdYyFfIiKkGgBbPpRrEeQqJjLl12", cmd)) {
+          stopped = false;
+          Serial.println("Resumed");
+        }
+      }
+
+      if (!stopped) {
+        if      (cmd == 'U' || cmd == 'u') { Serial.println("M1 back"); m1Backward(); delay(2000); m1Brake(); }
+        else if (cmd == 'D' || cmd == 'd') { Serial.println("M1 fwd");  m1Forward();  delay(2000); m1Brake(); }
+        else if (cmd == 'Y' || cmd == 'y') { Serial.println("M2 back"); m2Backward(); delay(2000); m2Brake(); }
+        else if (cmd == 'F' || cmd == 'f') { Serial.println("M2 fwd");  m2Forward();  delay(2000); m2Brake(); }
+        else if (cmd == 'I' || cmd == 'i') { Serial.println("M3 back"); m3Backward(); delay(M3_TIME); m3Brake(); }
+        else if (cmd == 'K' || cmd == 'k') { Serial.println("M3 fwd");  m3Forward();  delay(M3_TIME); m3Brake(); }
+        else if (cmd == 'G' || cmd == 'g') {
+          // Deploy both top motors together
+          Serial.print("Deploy "); Serial.print(G_TIME); Serial.println("ms");
+          m1Backward(); m2Backward(); delay(G_TIME); m1Brake(); m2Brake();
+        }
+        else if (cmd == 'B' || cmd == 'b') {
+          Serial.print("Retract "); Serial.print(B_TIME); Serial.println("ms");
+          m1Forward(); m2Forward(); delay(B_TIME); m1Brake(); m2Brake();
+        }
+        else if (cmd == 'P' || cmd == 'p') { Serial.println("Mag pull");  magPull();  delay(1000); magOff(); }
+        else if (cmd == 'R' || cmd == 'r') { Serial.println("Mag repel"); magRepel(); delay(1000); magOff(); }
+        else if (cmd == 'X' || cmd == 'x') { Serial.println("Mag off"); magOff(); }
+        // 3 second delay before the actuators fire so I can move my hand out the way
+        else if (cmd == 'E' || cmd == 'e') { Serial.println("ACT1 ext in 3s"); delay(3000); actMove(ACT_STEPS, +1); }
+        else if (cmd == 'Q' || cmd == 'q') { Serial.println("ACT1 ret in 3s"); delay(3000); actMove(ACT_STEPS, -1); }
+        else if (cmd == 'J' || cmd == 'j') { Serial.println("ACT2 ext in 3s"); delay(3000); act2Move(ACT2_STEPS, +1); }
+        else if (cmd == 'L' || cmd == 'l') { Serial.println("ACT2 ret in 3s"); delay(3000); act2Move(ACT2_STEPS, -1); }
+        else if (cmd == '1') {
+          // Quick test routine. just M3 + magnet repel
+          Serial.println("Seq 1");
+          m3Forward(); delay(2000);
+          magRepel();  delay(1500);
+          m3Brake();   magOff();
+          Serial.println("Seq 1 done");
+        }
+        else if (cmd == '2') {
+          // Full sequence end-to-end, same as watch BTN1 pressed twice
+          Serial.println("Seq 2 (full)");
+          runFullSeq2();
+          Serial.println("Seq 2 done");
+        }
+      }
+    }
+  }
+}
+
+// Motor control. one-line wrappers around ledcWrite
+void m1Forward()  { ledcWrite(M1_IN1, M1_SPEED); ledcWrite(M1_IN2, 0); }
+void m1Backward() { ledcWrite(M1_IN1, 0);        ledcWrite(M1_IN2, M1_SPEED); }
+void m1Brake()    { ledcWrite(M1_IN1, 0);        ledcWrite(M1_IN2, 0); }
+
+// M2 wired opposite to M1 - swap the IN pins to compensate
+void m2Forward()  { ledcWrite(M2_IN1, 0);        ledcWrite(M2_IN2, M2_SPEED); }
+void m2Backward() { ledcWrite(M2_IN1, M2_SPEED); ledcWrite(M2_IN2, 0); }
+void m2Brake()    { ledcWrite(M2_IN1, 0);        ledcWrite(M2_IN2, 0); }
+
+void m3Forward()  { ledcWrite(M3_IN1, M3_SPEED); ledcWrite(M3_IN2, 0); }
+void m3Backward() { ledcWrite(M3_IN1, 0);        ledcWrite(M3_IN2, M3_SPEED); }
+void m3Brake()    { ledcWrite(M3_IN1, 0);        ledcWrite(M3_IN2, 0); }
+
+// Magnet helpers. PH pin sets polarty, EN sets power
+void magPull()  { digitalWrite(MAG_SLEEP, HIGH); digitalWrite(MAG_PH, LOW);  ledcWrite(MAG_EN, MAG_SPEED); }
+void magRepel() { digitalWrite(MAG_SLEEP, HIGH); digitalWrite(MAG_PH, HIGH); ledcWrite(MAG_EN, MAG_SPEED); }
+void magOff()   { ledcWrite(MAG_EN, 0); digitalWrite(MAG_SLEEP, LOW); }
+
+void allBrake() { m1Brake(); m2Brake(); m3Brake(); magOff(); }
+
+// Stepper driver for ACT1
+void actCoilsOff() {
+  digitalWrite(ACT_IN1, LOW); digitalWrite(ACT_IN2, LOW);
+  digitalWrite(ACT_IN3, LOW); digitalWrite(ACT_IN4, LOW);
+}
+
+void actWritePhase(int step) {
+  digitalWrite(ACT_IN1, SEQ[step][0]); digitalWrite(ACT_IN2, SEQ[step][1]);
+  digitalWrite(ACT_IN3, SEQ[step][2]); digitalWrite(ACT_IN4, SEQ[step][3]);
+}
+
+void actMove(int steps, int direction) {
+  int idx = 0;
+  for (int i = 0; i < steps; i++) {
+    // Modulo trick for negative wrap-around
+    idx = ((idx + (direction * ACT_DIR_FLIP)) % 4 + 4) % 4;
+    actWritePhase(idx);
+    delayMicroseconds(ACT_DELAY_US);
+  }
+  actCoilsOff();  // don't leave coils energised
+}
+
+// ACT2. same logic, separate pins
+void act2CoilsOff() {
+  digitalWrite(ACT2_IN1, LOW); digitalWrite(ACT2_IN2, LOW);
+  digitalWrite(ACT2_IN3, LOW); digitalWrite(ACT2_IN4, LOW);
+}
+
+void act2WritePhase(int step) {
+  digitalWrite(ACT2_IN1, SEQ[step][0]); digitalWrite(ACT2_IN2, SEQ[step][1]);
+  digitalWrite(ACT2_IN3, SEQ[step][2]); digitalWrite(ACT2_IN4, SEQ[step][3]);
+}
+
+void act2Move(int steps, int direction) {
+  int idx = 0;
+  for (int i = 0; i < steps; i++) {
+    idx = ((idx + (direction * ACT_DIR_FLIP)) % 4 + 4) % 4;
+    act2WritePhase(idx);
+    delayMicroseconds(ACT_DELAY_US);
+  }
+  act2CoilsOff();
+}
