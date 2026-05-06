@@ -1,19 +1,19 @@
-//assisted by ai 
+//AI assisted
 #include <esp_now.h>
 #include <WiFi.h>
 
-// 6 PCBs total. each one has nSLEEP, EN (enable/power) and PH (phase/direction)
+// 6 driver-control channels driving 10 PCBs total. nS = nSLEEP, E = EN, P = PH
 // PCB 1
 const int nS1 = 13; const int E1 = 12; const int P1 = 14;
 // PCB 2
 const int nS2 = 27; const int E2 = 26; const int P2 = 25;
-// PCB 3
+// PCB 3 pins -> now drive PCBs 9+10 tied together (pair 5)
 const int nS3 = 33; const int E3 = 32; const int P3 = 17;
-// PCB 4
+// PCB 4 pins -> now drive PCBs 3+4 tied together (pair 2)
 const int nS4 = 16; const int E4 = 4;  const int P4 = 15;
-// PCB 5
+// PCB 5 pins -> drives PCBs 5+6 tied together (pair 3)
 const int nS5 = 18; const int E5 = 19; const int P5 = 21;
-// PCB 6
+// PCB 6 pins -> drives PCBs 7+8 tied together (pair 4)
 const int nS6 = 22; const int E6 = 23; const int P6 = 5;
 
 // Housing ESP MAC. the one I read off the chip with esp_read_mac
@@ -73,10 +73,20 @@ void setup() {
   digitalWrite(P3, LOW); digitalWrite(P4, LOW);
   digitalWrite(P5, LOW); digitalWrite(P6, LOW);
 
-  Serial.println("--- MAGNET ESP READY ---");
+  Serial.println("--- MAGNET ESP READY (10 PCBs / 5 pairs) ---");
   Serial.println("Waiting for RUN from housing, or use serial:");
   Serial.println("  G -> full routine");
-  Serial.println("  1-6 -> 1s pulse for that PCB");
+  Serial.println("  1 -> 1s attract pulse PCB 1");
+  Serial.println("  2 -> 1s attract pulse PCB 2");
+  Serial.println("  3 -> 1s attract pulse pair 5 (PCBs 9+10)");
+  Serial.println("  4 -> 1s attract pulse pair 2 (PCBs 3+4)");
+  Serial.println("  5 -> 1s attract pulse pair 3 (PCBs 5+6)");
+  Serial.println("  6 -> 1s attract pulse pair 4 (PCBs 7+8)");
+  Serial.println("  Z/X -> pair 1 (PCBs 1+2) attract/repel");
+  Serial.println("  C/V -> pair 2 (PCBs 3+4) attract/repel");
+  Serial.println("  B/N -> pair 3 (PCBs 5+6) attract/repel");
+  Serial.println("  M/L -> pair 4 (PCBs 7+8) attract/repel");
+  Serial.println("  A/D -> pair 5 (PCBs 9+10) attract/repel");
   Serial.println("  R -> fault recovery");
   Serial.println("  S -> emergency stop");
 }
@@ -94,13 +104,31 @@ void loop() {
   if (Serial.available() > 0) {
     char input = toupper(Serial.read());
 
-    // Single PCB pulse. useful for checking each one works
+    // Single channel attract pulse. useful for checking each GPIO set works
     if (input == '1')      pulseMagnet(E1, P1, "PCB 1");
     else if (input == '2') pulseMagnet(E2, P2, "PCB 2");
-    else if (input == '3') pulseMagnet(E3, P3, "PCB 3");
-    else if (input == '4') pulseMagnet(E4, P4, "PCB 4");
-    else if (input == '5') pulseMagnet(E5, P5, "PCB 5");
-    else if (input == '6') pulseMagnet(E6, P6, "PCB 6");
+    else if (input == '3') pulseMagnet(E3, P3, "Pair 5 (PCBs 9+10)");
+    else if (input == '4') pulseMagnet(E4, P4, "Pair 2 (PCBs 3+4)");
+    else if (input == '5') pulseMagnet(E5, P5, "Pair 3 (PCBs 5+6)");
+    else if (input == '6') pulseMagnet(E6, P6, "Pair 4 (PCBs 7+8)");
+
+    // Pair-level attract/repel pulses (1s each)
+    // Z/X = pair 1 (PCBs 1+2, two separate GPIO sets)
+    // C/V = pair 2 (PCBs 3+4, on PCB4 GPIO set)
+    // B/N = pair 3 (PCBs 5+6, on PCB5 GPIO set)
+    // M/L = pair 4 (PCBs 7+8, on PCB6 GPIO set)
+    // A/D = pair 5 (PCBs 9+10, on PCB3 GPIO set)
+    else if (input == 'Z') pairAttract(E1, P1, E2, P2, "Pair 1 (PCBs 1+2)");
+    else if (input == 'X') pairRepel  (E1, P1, E2, P2, "Pair 1 (PCBs 1+2)");
+    else if (input == 'C') singleAttract(E4, P4, "Pair 2 (PCBs 3+4)");
+    else if (input == 'V') singleRepel  (E4, P4, "Pair 2 (PCBs 3+4)");
+    else if (input == 'B') singleAttract(E5, P5, "Pair 3 (PCBs 5+6)");
+    else if (input == 'N') singleRepel  (E5, P5, "Pair 3 (PCBs 5+6)");
+    else if (input == 'M') singleAttract(E6, P6, "Pair 4 (PCBs 7+8)");
+    else if (input == 'L') singleRepel  (E6, P6, "Pair 4 (PCBs 7+8)");
+    else if (input == 'A') singleAttract(E3, P3, "Pair 5 (PCBs 9+10)");
+    else if (input == 'D') singleRepel  (E3, P3, "Pair 5 (PCBs 9+10)");
+
     else if (input == 'R') recoverFault();   // toggles nSLEEP to clear fault latch
     else if (input == 'S') {
       allOff();
@@ -113,7 +141,7 @@ void loop() {
   }
 }
 
-// Quick 1 second attract pulse on a single PCB
+// Quick 1 second attract pulse on a single GPIO set
 void pulseMagnet(int enPin, int phPin, const char* name) {
   Serial.print(name); Serial.println(": attract 1s");
   digitalWrite(phPin, HIGH);
@@ -121,6 +149,48 @@ void pulseMagnet(int enPin, int phPin, const char* name) {
   delay(1000);
   digitalWrite(enPin, LOW);
   digitalWrite(phPin, LOW);
+  Serial.print(name); Serial.println(": OFF");
+}
+
+// 1 second attract pulse on a paired channel (two separate GPIO sets, e.g. pair 1)
+void pairAttract(int en1, int ph1, int en2, int ph2, const char* name) {
+  Serial.print(name); Serial.println(": attract 1s");
+  digitalWrite(ph1, HIGH); digitalWrite(ph2, HIGH);
+  digitalWrite(en1, HIGH); digitalWrite(en2, HIGH);
+  delay(1000);
+  digitalWrite(en1, LOW);  digitalWrite(en2, LOW);
+  digitalWrite(ph1, LOW);  digitalWrite(ph2, LOW);
+  Serial.print(name); Serial.println(": OFF");
+}
+
+// 1 second repel pulse on a paired channel (two separate GPIO sets, e.g. pair 1)
+void pairRepel(int en1, int ph1, int en2, int ph2, const char* name) {
+  Serial.print(name); Serial.println(": repel 1s");
+  digitalWrite(ph1, LOW);  digitalWrite(ph2, LOW);   // PH low + EN high = repel
+  digitalWrite(en1, HIGH); digitalWrite(en2, HIGH);
+  delay(1000);
+  digitalWrite(en1, LOW);  digitalWrite(en2, LOW);
+  Serial.print(name); Serial.println(": OFF");
+}
+
+// 1 second attract pulse on a single GPIO set (controls one or more tied PCBs)
+void singleAttract(int enPin, int phPin, const char* name) {
+  Serial.print(name); Serial.println(": attract 1s");
+  digitalWrite(phPin, HIGH);
+  digitalWrite(enPin, HIGH);
+  delay(1000);
+  digitalWrite(enPin, LOW);
+  digitalWrite(phPin, LOW);
+  Serial.print(name); Serial.println(": OFF");
+}
+
+// 1 second repel pulse on a single GPIO set (controls one or more tied PCBs)
+void singleRepel(int enPin, int phPin, const char* name) {
+  Serial.print(name); Serial.println(": repel 1s");
+  digitalWrite(phPin, LOW);   // PH low + EN high = repel
+  digitalWrite(enPin, HIGH);
+  delay(1000);
+  digitalWrite(enPin, LOW);
   Serial.print(name); Serial.println(": OFF");
 }
 
@@ -146,65 +216,55 @@ void recoverFault() {
   Serial.println(">>> Reset, ready");
 }
 
-// The full attract/repel routine. choreographs all 6 PCBs to deploy the plates
+// Sequence: C, X, B, A(+N overlap), N
+// 100ms pause between each step. A->N has 100ms overlap instead of gap.
+// Every EN and PH pin explicitly reset after each step to prevent anything being left on.
 void runSequence() {
   Serial.println(">>> MAGNET ROUTINE START");
   allOff();
   Serial.println("STEP 1: all off (5s)");
-  delay(5000);  // long pause so I can see it's actually starting
+  delay(300);  // long pause so I can see it's actually starting
 
-  // Pull plates 1 & 2 in
-  digitalWrite(P1, HIGH); digitalWrite(P2, HIGH);
-  digitalWrite(E1, HIGH); digitalWrite(E2, HIGH);
-  Serial.println("STEP 2: 1&2 attract");
-  delay(1000);
-
-  allOff();
-  Serial.println("STEP 3: pause");
+  // C: pair 2 (PCBs 3+4, PCB4 GPIO set) attract
+  digitalWrite(P4, HIGH); digitalWrite(E4, HIGH);
+  Serial.println("C: pair2 attract ON");
   delay(500);
+  digitalWrite(E4, LOW); digitalWrite(P4, LOW);  // explicit EN + PH reset
+  Serial.println("C: off");
+  delay(100);  // pause
 
-  digitalWrite(P3, HIGH); digitalWrite(P4, HIGH);
-  digitalWrite(E3, HIGH); digitalWrite(E4, HIGH);
-  Serial.println("STEP 4: 3&4 attract");
-  delay(1000);
-
-  allOff();
-  Serial.println("STEP 5: pause");
-  delay(500);
-
-  // Now repel 1&2 (PH low + EN high = opposite polarity)
+  // X: pair 1 (PCBs 1+2, two GPIO sets) repel
   digitalWrite(P1, LOW);  digitalWrite(P2, LOW);
   digitalWrite(E1, HIGH); digitalWrite(E2, HIGH);
-  Serial.println("STEP 6: 1&2 repel");
-  delay(1000);
+  Serial.println("X: pair1 repel ON");
+  delay(500);
+  digitalWrite(E1, LOW); digitalWrite(E2, LOW);  // PH already LOW from repel, leave it
+  Serial.println("X: off");
+  delay(100);  // pause
 
-  allOff();
-  Serial.println("STEP 7: pause");
+  // B: pair 3 (PCBs 5+6, PCB5 GPIO set) attract
+  digitalWrite(P5, HIGH); digitalWrite(E5, HIGH);
+  Serial.println("B: pair3 attract ON");
+  delay(1000);
+  digitalWrite(E5, LOW); digitalWrite(P5, LOW);  // explicit EN + PH reset
+  Serial.println("B: off");
+  delay(100);  // pause
+
+  // A: pair 5 (PCBs 9+10, PCB3 GPIO set) attract — runs 900ms then N overlaps
+  digitalWrite(P3, HIGH); digitalWrite(E3, HIGH);
+  Serial.println("A: pair5 attract ON");
   delay(500);
 
-  digitalWrite(P5, HIGH); digitalWrite(P6, HIGH);
-  digitalWrite(E5, HIGH); digitalWrite(E6, HIGH);
-  Serial.println("STEP 8: 5&6 attract");
-  delay(1000);
+  // N: pair 3 (PCBs 5+6, PCB5 GPIO set) repel — last 0.1s overlap with A
+  // P5 already LOW from B ending, correct polarity for repel
+  digitalWrite(P5, LOW); digitalWrite(E5, HIGH);
+  Serial.println("N: pair3 repel ON — 0.1s overlap with A");
+  delay(100);  // overlap window, then A turns off
+  digitalWrite(E3, LOW); digitalWrite(P3, LOW);  // explicit EN + PH reset
+  Serial.println("A: off");
+  delay(900);  // N runs alone for remaining 900ms
 
-  allOff();
-  Serial.println("STEP 9: pause");
-  delay(500);
-
-  digitalWrite(P3, LOW);  digitalWrite(P4, LOW);
-  digitalWrite(E3, HIGH); digitalWrite(E4, HIGH);
-  Serial.println("STEP 10: 3&4 repel");
-  delay(1000);
-
-  allOff();
-  Serial.println("STEP 11: pause");
-  delay(500);
-
-  digitalWrite(P5, LOW);  digitalWrite(P6, LOW);
-  digitalWrite(E5, HIGH); digitalWrite(E6, HIGH);
-  Serial.println("STEP 12: 5&6 repel");
-  delay(1000);
-
+  // N off, all done
   allOff();
   Serial.println(">>> ROUTINE DONE");
 }
